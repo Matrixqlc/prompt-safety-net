@@ -5,9 +5,15 @@
 ## 安装
 
 1. 安装 [Tampermonkey](https://www.tampermonkey.net/)。
-2. 在 Tampermonkey 中新建脚本。
-3. 将 [`chatgpt_prompt_safety_net.js`](./chatgpt_prompt_safety_net.js) 的完整内容粘贴并保存。
-4. 打开 `https://chatgpt.com/`，右下角会出现“Prompt 安全网”。
+2. 打开 [`chatgpt_prompt_safety_net.user.js`](./chatgpt_prompt_safety_net.user.js)。
+3. 点击 GitHub 页面里的 **Raw**；Tampermonkey 会识别 `.user.js` 并打开安装界面。
+4. 安装后打开 `https://chatgpt.com/`，右下角会出现“Prompt 安全网”。
+
+## 自动更新
+
+脚本已经配置 `@updateURL` 和 `@downloadURL`，指向本仓库 `main` 分支的 Raw 文件。后续发布新版本时，只要提高 userscript 头部的 `@version`，Tampermonkey 就可以检测并更新本地脚本。
+
+> 自动更新依赖 Raw 文件可匿名访问，因此仓库需要保持为 Public。
 
 ## 功能
 
