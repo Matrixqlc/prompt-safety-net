@@ -1,4 +1,4 @@
-# ChatGPT Prompt Safety Net
+# Prompt Safety Net
 
 一个 Tampermonkey 用户脚本，用于在 ChatGPT 网页中保护文字 Prompt：自动保存未发送草稿、归档已提交的 Prompt，并在网络离线或回复长期没有进展时提醒。
 
@@ -24,4 +24,4 @@
 
 ## 文档
 
-使用说明、设计记录和变更日志维护在独立文档仓库：`ChatGPT-Prompt-Safety-Net-Docs`。
+使用说明、设计记录和变更日志维护在独立文档仓库：[prompt-safety-net-docs](https://github.com/Matrixqlc/prompt-safety-net-docs)。

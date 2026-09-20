@@ -1,5 +1,5 @@
 // ==UserScript==
-// @name         ChatGPT Prompt Safety Net
+// @name         Prompt Safety Net for ChatGPT
 // @namespace    https://chatgpt.com/
 // @version      0.3.0
 // @description  Auto-save ChatGPT prompts, archive submitted prompts, restore after refresh, and warn about offline/stalled responses.
