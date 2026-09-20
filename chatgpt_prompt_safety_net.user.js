@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Prompt Safety Net for ChatGPT
 // @namespace    https://chatgpt.com/
-// @version      0.6.2
+// @version      0.6.3
 // @description  Auto-save ChatGPT prompts, archive submitted prompts, restore after refresh, and warn about offline/stalled responses.
 // @author       ChatGPT
 // @homepageURL  https://github.com/Matrixqlc/prompt-safety-net
@@ -209,6 +209,52 @@
     historyPage = 0;
     updatePanel();
     toast(h[i].favorite ? '已收藏' : '已取消收藏');
+  }
+
+  function exportHistory() {
+    const prompts = getHistory().map(item => ({
+      text: item.text || '',
+      favorite: !!item.favorite,
+      useCount: Number(item.useCount) || 1,
+      firstSentAt: Number(item.firstSentAt) || Number(item.sentAt) || null,
+      sentAt: Number(item.sentAt) || null,
+      status: item.status || 'saved',
+      routeKey: item.routeKey || null,
+      url: item.url || null,
+    }));
+
+    if (!prompts.length) {
+      toast('还没有可导出的 Prompt');
+      return;
+    }
+
+    const payload = {
+      format: 'prompt-safety-net',
+      schemaVersion: 1,
+      exportedAt: new Date().toISOString(),
+      promptCount: prompts.length,
+      prompts,
+    };
+
+    const now = new Date();
+    const pad = n => String(n).padStart(2, '0');
+    const filename =
+      `prompt-safety-net-${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}.json`;
+
+    const blob = new Blob([JSON.stringify(payload, null, 2)], {
+      type: 'application/json;charset=utf-8',
+    });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    a.style.display = 'none';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+
+    toast(`已导出 ${prompts.length} 条 Prompt`);
   }
 
   // ---------- DOM helpers ----------
@@ -604,6 +650,7 @@
           <button data-act="restore-draft">恢复未发送草稿</button>
           <button data-act="restore-last">恢复上次发送</button>
           <button data-act="copy-last">复制上次发送</button>
+          <button data-act="export">导出</button>
           <button data-act="clear">清空记录</button>
         </div>
         <div id="cgpt-psn-list"></div>
@@ -633,6 +680,7 @@
       if (act === 'restore-draft') restoreUnsentDraft();
       if (act === 'restore-last') restoreLastSent();
       if (act === 'copy-last') await copyLastSent();
+      if (act === 'export') exportHistory();
 
       if (act === 'clear') {
         try {
