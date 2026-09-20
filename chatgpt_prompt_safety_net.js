@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Prompt Safety Net for ChatGPT
 // @namespace    https://chatgpt.com/
-// @version      0.3.0
+// @version      0.4.0
 // @description  Auto-save ChatGPT prompts, archive submitted prompts, restore after refresh, and warn about offline/stalled responses.
 // @author       ChatGPT
 // @match        https://chatgpt.com/*
@@ -71,13 +71,76 @@
 
   const draftKey = (rk = routeKey()) => K.DRAFT_PREFIX + rk;
 
+  function normalizePromptText(text) {
+    return String(text || '').replace(/\r\n?/g, '\n').trim();
+  }
+
+  function normalizeHistory(items) {
+    const byText = new Map();
+
+    for (const raw of Array.isArray(items) ? items : []) {
+      if (!raw?.text) continue;
+
+      const key = normalizePromptText(raw.text);
+      if (!key) continue;
+
+      const count = Number.isFinite(raw.useCount) && raw.useCount > 0
+        ? Math.floor(raw.useCount)
+        : 1;
+      const sentAt = Number(raw.sentAt) || 0;
+      const firstSentAt = Number(raw.firstSentAt) || sentAt || Date.now();
+      const current = byText.get(key);
+
+      if (!current) {
+        byText.set(key, {
+          ...raw,
+          useCount: count,
+          favorite: !!raw.favorite,
+          firstSentAt,
+        });
+        continue;
+      }
+
+      const currentSentAt = Number(current.sentAt) || 0;
+      const newest = sentAt >= currentSentAt ? raw : current;
+      const oldestSentAt = Math.min(
+        Number(current.firstSentAt) || currentSentAt || firstSentAt,
+        firstSentAt
+      );
+
+      byText.set(key, {
+        ...current,
+        ...newest,
+        id: newest.id || current.id,
+        text: newest.text || current.text,
+        useCount: (Number(current.useCount) || 1) + count,
+        favorite: !!(current.favorite || raw.favorite),
+        firstSentAt: oldestSentAt,
+      });
+    }
+
+    return [...byText.values()].sort((a, b) => {
+      if (!!a.favorite !== !!b.favorite) return a.favorite ? -1 : 1;
+      return (Number(b.sentAt) || 0) - (Number(a.sentAt) || 0);
+    });
+  }
+
   function getHistory() {
-    const h = read(K.HISTORY, []);
-    return Array.isArray(h) ? h : [];
+    const raw = read(K.HISTORY, []);
+    const normalized = normalizeHistory(raw).slice(0, CFG.historyLimit);
+
+    // Migrate old duplicated records in place as soon as they are read.
+    try {
+      if (JSON.stringify(raw) !== JSON.stringify(normalized)) {
+        write(K.HISTORY, normalized);
+      }
+    } catch {}
+
+    return normalized;
   }
 
   function setHistory(h) {
-    write(K.HISTORY, h.slice(0, CFG.historyLimit));
+    write(K.HISTORY, normalizeHistory(h).slice(0, CFG.historyLimit));
   }
 
   function upsertHistory(item) {
@@ -86,6 +149,48 @@
     if (i >= 0) h[i] = { ...h[i], ...item };
     else h.unshift(item);
     setHistory(h);
+  }
+
+  function findHistoryByText(text) {
+    const key = normalizePromptText(text);
+    if (!key) return null;
+    return getHistory().find(x => normalizePromptText(x.text) === key) || null;
+  }
+
+  function deleteHistoryItem(id) {
+    const h = getHistory();
+    const item = h.find(x => x.id === id);
+    if (!item) return;
+
+    setHistory(h.filter(x => x.id !== id));
+
+    const last = read(K.LAST_SENT, null);
+    const sameAsLast = last && (
+      last.id === id ||
+      normalizePromptText(last.text) === normalizePromptText(item.text)
+    );
+    if (sameAsLast) remove(K.LAST_SENT);
+
+    if (currentPending && (
+      currentPending.id === id ||
+      normalizePromptText(currentPending.text) === normalizePromptText(item.text)
+    )) {
+      currentPending = null;
+    }
+
+    updatePanel();
+    toast('已删除这条 Prompt');
+  }
+
+  function toggleFavorite(id) {
+    const h = getHistory();
+    const i = h.findIndex(x => x.id === id);
+    if (i < 0) return;
+
+    h[i] = { ...h[i], favorite: !h[i].favorite };
+    setHistory(h);
+    updatePanel();
+    toast(h[i].favorite ? '已收藏' : '已取消收藏');
   }
 
   // ---------- DOM helpers ----------
@@ -247,14 +352,29 @@
     lastCapturedText = text;
     lastCapturedAt = now;
 
-    const item = {
-      id: makeId(text, now),
+    const existing = findHistoryByText(text);
+    const item = existing ? {
+      ...existing,
       text,
       sentAt: now,
       url: location.href,
       routeKey: routeKey(),
       reason,
       status: 'pending',
+      useCount: (Number(existing.useCount) || 1) + 1,
+      firstSentAt: existing.firstSentAt || existing.sentAt || now,
+      favorite: !!existing.favorite,
+    } : {
+      id: makeId(text, now),
+      text,
+      sentAt: now,
+      firstSentAt: now,
+      url: location.href,
+      routeKey: routeKey(),
+      reason,
+      status: 'pending',
+      useCount: 1,
+      favorite: false,
     };
 
     write(K.LAST_SENT, item);
@@ -417,6 +537,7 @@
       .cgpt-psn-actions { display:flex; flex-wrap:wrap; gap:6px; margin-bottom:10px; }
       .cgpt-psn-actions button, .cgpt-psn-item button { border:1px solid rgba(0,0,0,.15); background:#fff; border-radius:8px; padding:6px 8px; cursor:pointer; }
       .cgpt-psn-item { border-top:1px solid rgba(0,0,0,.09); padding:9px 0; }
+      .cgpt-psn-item[data-favorite="true"] .cgpt-psn-meta { opacity:.9; font-weight:600; }
       .cgpt-psn-meta { opacity:.62; font-size:11px; margin-bottom:4px; }
       .cgpt-psn-preview { white-space:pre-wrap; max-height:4.4em; overflow:hidden; word-break:break-word; margin-bottom:6px; }
       .cgpt-psn-foot { opacity:.55; font-size:11px; margin-top:8px; }
@@ -511,6 +632,17 @@
           }
         }
       }
+
+      if (act === 'delete-history') {
+        const id = b.dataset.id;
+        if (window.confirm('删除这条 Prompt 记录？')) {
+          deleteHistoryItem(id);
+        }
+      }
+
+      if (act === 'toggle-favorite') {
+        toggleFavorite(b.dataset.id);
+      }
     });
 
     updatePanel();
@@ -556,11 +688,13 @@
     }
 
     uiList.innerHTML = hist.map(item => `
-      <div class="cgpt-psn-item">
-        <div class="cgpt-psn-meta">${escapeHtml(fmtTime(item.sentAt))} · ${escapeHtml(item.status || 'saved')}</div>
+      <div class="cgpt-psn-item" data-favorite="${item.favorite ? 'true' : 'false'}">
+        <div class="cgpt-psn-meta">${item.favorite ? '★ 已收藏 · ' : ''}${escapeHtml(fmtTime(item.sentAt))} · 已使用 ${escapeHtml(Number(item.useCount) || 1)} 次 · ${escapeHtml(item.status || 'saved')}</div>
         <div class="cgpt-psn-preview">${escapeHtml(item.text || '')}</div>
         <button data-act="restore-history" data-id="${escapeHtml(item.id)}">恢复</button>
         <button data-act="copy-history" data-id="${escapeHtml(item.id)}">复制</button>
+        <button data-act="delete-history" data-id="${escapeHtml(item.id)}">删除</button>
+        <button data-act="toggle-favorite" data-id="${escapeHtml(item.id)}">${item.favorite ? '取消收藏' : '收藏'}</button>
       </div>
     `).join('');
   }
