@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Prompt Safety Net for ChatGPT
 // @namespace    https://chatgpt.com/
-// @version      0.4.1
+// @version      0.5.0
 // @description  Auto-save ChatGPT prompts, archive submitted prompts, restore after refresh, and warn about offline/stalled responses.
 // @author       ChatGPT
 // @homepageURL  https://github.com/Matrixqlc/prompt-safety-net
@@ -27,7 +27,8 @@
     stallWarnMs: 120_000,        // 2 min without visible response progress => "possibly stuck"
     autoRestoreMaxAgeMs: 24 * 60 * 60 * 1000,
     pendingResumeMaxAgeMs: 2 * 60 * 60 * 1000,
-    historyLimit: 30,
+    regularHistoryLimit: 200,   // favorites are kept outside this cap
+    pageSize: 8,
     pollMs: 2000,
   };
 
@@ -48,6 +49,7 @@
   let lastProgressAt = 0;
   let responseStarted = false;
   let editorTouchedThisSession = false;
+  let historyPage = 0;
 
   // ---------- Storage ----------
   const read = (key, fallback = null) => {
@@ -129,22 +131,32 @@
     });
   }
 
+  function pruneHistory(items) {
+    const normalized = normalizeHistory(items);
+    const favorites = normalized.filter(item => item.favorite);
+    const regular = normalized
+      .filter(item => !item.favorite)
+      .slice(0, CFG.regularHistoryLimit);
+
+    return [...favorites, ...regular];
+  }
+
   function getHistory() {
     const raw = read(K.HISTORY, []);
-    const normalized = normalizeHistory(raw).slice(0, CFG.historyLimit);
+    const pruned = pruneHistory(raw);
 
-    // Migrate old duplicated records in place as soon as they are read.
+    // Migrate old duplicated records and apply the new retention rule in place.
     try {
-      if (JSON.stringify(raw) !== JSON.stringify(normalized)) {
-        write(K.HISTORY, normalized);
+      if (JSON.stringify(raw) !== JSON.stringify(pruned)) {
+        write(K.HISTORY, pruned);
       }
     } catch {}
 
-    return normalized;
+    return pruned;
   }
 
   function setHistory(h) {
-    write(K.HISTORY, normalizeHistory(h).slice(0, CFG.historyLimit));
+    write(K.HISTORY, pruneHistory(h));
   }
 
   function upsertHistory(item) {
@@ -193,6 +205,7 @@
 
     h[i] = { ...h[i], favorite: !h[i].favorite };
     setHistory(h);
+    historyPage = 0;
     updatePanel();
     toast(h[i].favorite ? '已收藏' : '已取消收藏');
   }
@@ -383,6 +396,7 @@
 
     write(K.LAST_SENT, item);
     upsertHistory(item);
+    historyPage = 0;
 
     // Once submitted, it is no longer an "unsent draft"; keep it safely in history.
     remove(draftKey());
@@ -523,7 +537,7 @@
   }
 
   // ---------- UI ----------
-  let uiRoot, uiButton, uiPanel, uiStatus, uiList;
+  let uiRoot, uiButton, uiPanel, uiStatus, uiList, uiPager;
 
   function injectStyle() {
     if (document.getElementById('cgpt-psn-style')) return;
@@ -539,19 +553,34 @@
       .cgpt-psn-title { font-weight: 700; margin-bottom: 5px; }
       .cgpt-psn-status { padding: 7px 8px; border-radius: 9px; background: rgba(0,0,0,.05); margin-bottom: 9px; word-break: break-word; }
       .cgpt-psn-actions { display:flex; flex-wrap:wrap; gap:6px; margin-bottom:10px; }
-      .cgpt-psn-actions button, .cgpt-psn-item button { border:1px solid rgba(0,0,0,.15); background:#fff; border-radius:8px; padding:6px 8px; cursor:pointer; }
+      .cgpt-psn-actions button, .cgpt-psn-item button, .cgpt-psn-pagination button { border:1px solid rgba(0,0,0,.15); background:#fff; border-radius:8px; padding:6px 8px; cursor:pointer; }
+      .cgpt-psn-pagination button:disabled { opacity:.38; cursor:default; }
       .cgpt-psn-item { border-top:1px solid rgba(0,0,0,.09); padding:9px 0; }
       .cgpt-psn-item[data-favorite="true"] .cgpt-psn-meta { opacity:.9; font-weight:600; }
       .cgpt-psn-meta { opacity:.62; font-size:11px; margin-bottom:4px; }
       .cgpt-psn-preview { white-space:pre-wrap; max-height:4.4em; overflow:hidden; word-break:break-word; margin-bottom:6px; }
+      .cgpt-psn-item-actions { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:6px; }
+      .cgpt-psn-pagination { position:sticky; bottom:-12px; display:flex; align-items:center; justify-content:space-between; gap:8px; padding:8px 0 2px; margin-top:4px; border-top:1px solid rgba(0,0,0,.09); background:rgba(255,255,255,.985); }
+      .cgpt-psn-page-info { flex:1; text-align:center; font-size:11px; opacity:.7; white-space:nowrap; }
       .cgpt-psn-foot { opacity:.55; font-size:11px; margin-top:8px; }
       #cgpt-psn-toast { position:fixed; left:50%; bottom:26px; transform:translateX(-50%); z-index:2147483647; background:rgba(0,0,0,.82); color:#fff; border-radius:9px; padding:8px 12px; font:13px system-ui; pointer-events:none; opacity:0; transition:opacity .18s; }
       @media (prefers-color-scheme: dark) {
         #cgpt-psn-root { color:#eee; }
         #cgpt-psn-button, #cgpt-psn-panel { background:rgba(31,31,31,.97); color:#eee; border-color:rgba(255,255,255,.16); }
         .cgpt-psn-status { background:rgba(255,255,255,.08); }
-        .cgpt-psn-actions button, .cgpt-psn-item button { background:#282828; color:#eee; border-color:rgba(255,255,255,.16); }
+        .cgpt-psn-actions button, .cgpt-psn-item button, .cgpt-psn-pagination button { background:#282828; color:#eee; border-color:rgba(255,255,255,.16); }
         .cgpt-psn-item { border-top-color:rgba(255,255,255,.11); }
+        .cgpt-psn-pagination { background:rgba(31,31,31,.97); border-top-color:rgba(255,255,255,.11); }
+      }
+      @media (max-width: 640px) {
+        #cgpt-psn-root { left:8px; right:8px; bottom:76px; }
+        #cgpt-psn-button { float:right; }
+        #cgpt-psn-panel { width:100%; max-height:74vh; box-sizing:border-box; padding:10px; }
+        .cgpt-psn-actions button { flex:1 1 calc(50% - 3px); padding:6px 5px; }
+        .cgpt-psn-preview { max-height:3em; }
+        .cgpt-psn-item-actions { gap:4px; }
+        .cgpt-psn-item-actions button { min-width:0; padding:6px 3px; font-size:12px; }
+        .cgpt-psn-pagination { bottom:-10px; }
       }
     `;
     document.head?.appendChild(st);
@@ -575,7 +604,8 @@
           <button data-act="clear">清空记录</button>
         </div>
         <div id="cgpt-psn-list"></div>
-        <div class="cgpt-psn-foot">仅保存文字 Prompt；附件/图片不会被备份。数据保存在 Tampermonkey 本地脚本存储中。</div>
+        <div id="cgpt-psn-pagination" class="cgpt-psn-pagination" hidden></div>
+        <div class="cgpt-psn-foot">仅保存文字 Prompt；附件/图片不会被备份。普通历史最多保留 200 条，收藏不参与自动淘汰。数据保存在 Tampermonkey 本地脚本存储中。</div>
       </div>
       <button id="cgpt-psn-button" title="Prompt 安全网">Prompt 安全网</button>
     `;
@@ -585,6 +615,7 @@
     uiButton = uiRoot.querySelector('#cgpt-psn-button');
     uiStatus = uiRoot.querySelector('#cgpt-psn-status');
     uiList = uiRoot.querySelector('#cgpt-psn-list');
+    uiPager = uiRoot.querySelector('#cgpt-psn-pagination');
 
     uiButton.addEventListener('click', () => {
       uiPanel.classList.toggle('open');
@@ -611,6 +642,7 @@
         remove(K.HISTORY);
         remove(K.LAST_SENT);
         currentPending = null;
+        historyPage = 0;
         setStatus('本地 Prompt 记录已清空', 'ok');
         updatePanel();
         toast('记录已清空');
@@ -646,6 +678,16 @@
 
       if (act === 'toggle-favorite') {
         toggleFavorite(b.dataset.id);
+      }
+
+      if (act === 'page-prev') {
+        historyPage = Math.max(0, historyPage - 1);
+        updatePanel();
+      }
+
+      if (act === 'page-next') {
+        historyPage += 1;
+        updatePanel();
       }
     });
 
@@ -683,24 +725,41 @@
 
   function updatePanel() {
     ensureUI();
-    if (!uiList) return;
+    if (!uiList || !uiPager) return;
 
-    const hist = getHistory().slice(0, 8);
+    const hist = getHistory();
     if (!hist.length) {
+      historyPage = 0;
       uiList.innerHTML = '<div class="cgpt-psn-meta">还没有发送历史。</div>';
+      uiPager.hidden = true;
+      uiPager.innerHTML = '';
       return;
     }
 
-    uiList.innerHTML = hist.map(item => `
+    const totalPages = Math.max(1, Math.ceil(hist.length / CFG.pageSize));
+    historyPage = Math.min(Math.max(0, historyPage), totalPages - 1);
+    const start = historyPage * CFG.pageSize;
+    const pageItems = hist.slice(start, start + CFG.pageSize);
+
+    uiList.innerHTML = pageItems.map(item => `
       <div class="cgpt-psn-item" data-favorite="${item.favorite ? 'true' : 'false'}">
         <div class="cgpt-psn-meta">${item.favorite ? '★ 已收藏 · ' : ''}${escapeHtml(fmtTime(item.sentAt))} · 已使用 ${escapeHtml(Number(item.useCount) || 1)} 次 · ${escapeHtml(item.status || 'saved')}</div>
         <div class="cgpt-psn-preview">${escapeHtml(item.text || '')}</div>
-        <button data-act="restore-history" data-id="${escapeHtml(item.id)}">恢复</button>
-        <button data-act="copy-history" data-id="${escapeHtml(item.id)}">复制</button>
-        <button data-act="delete-history" data-id="${escapeHtml(item.id)}">删除</button>
-        <button data-act="toggle-favorite" data-id="${escapeHtml(item.id)}">${item.favorite ? '取消收藏' : '收藏'}</button>
+        <div class="cgpt-psn-item-actions">
+          <button data-act="restore-history" data-id="${escapeHtml(item.id)}">恢复</button>
+          <button data-act="copy-history" data-id="${escapeHtml(item.id)}">复制</button>
+          <button data-act="delete-history" data-id="${escapeHtml(item.id)}">删除</button>
+          <button data-act="toggle-favorite" data-id="${escapeHtml(item.id)}">${item.favorite ? '取消收藏' : '收藏'}</button>
+        </div>
       </div>
     `).join('');
+
+    uiPager.hidden = totalPages <= 1;
+    uiPager.innerHTML = totalPages <= 1 ? '' : `
+      <button data-act="page-prev" ${historyPage === 0 ? 'disabled' : ''}>‹ 上一页</button>
+      <span class="cgpt-psn-page-info">${historyPage + 1} / ${totalPages} · ${hist.length} 条</span>
+      <button data-act="page-next" ${historyPage >= totalPages - 1 ? 'disabled' : ''}>下一页 ›</button>
+    `;
   }
 
   let toastTimer = null;
