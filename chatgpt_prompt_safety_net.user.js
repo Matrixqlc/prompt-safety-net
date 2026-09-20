@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Prompt Safety Net for ChatGPT
 // @namespace    https://chatgpt.com/
-// @version      0.6.0
+// @version      0.6.1
 // @description  Auto-save ChatGPT prompts, archive submitted prompts, restore after refresh, and warn about offline/stalled responses.
 // @author       ChatGPT
 // @homepageURL  https://github.com/Matrixqlc/prompt-safety-net
@@ -24,11 +24,11 @@
   const CFG = {
     draftDebounceMs: 250,
     autosaveHeartbeatMs: 2000,
-    stallWarnMs: 120_000,        // 2 min without visible response progress => "possibly stuck"
+    stallWarnMs: 120_000, // 2 min without visible response progress => "possibly stuck"
     autoRestoreMaxAgeMs: 24 * 60 * 60 * 1000,
     pendingResumeMaxAgeMs: 2 * 60 * 60 * 1000,
-    regularHistoryLimit: 200,   // favorites are kept outside this cap
-    panelViewportRatio: 0.88,    // approximate maximum panel height before making another page
+    regularHistoryLimit: 200, // favorites are kept outside this cap
+    panelViewportRatio: 0.88, // approximate maximum panel height before making another page
     minPageContentHeight: 220,
     pollMs: 2000,
   };
@@ -146,7 +146,7 @@
     const raw = read(K.HISTORY, []);
     const pruned = pruneHistory(raw);
 
-    // Migrate old duplicated records and apply the new retention rule in place.
+   // Migrate old duplicated records and apply the new retention rule in place.
     try {
       if (JSON.stringify(raw) !== JSON.stringify(pruned)) {
         write(K.HISTORY, pruned);
@@ -258,8 +258,8 @@
       return true;
     }
 
-    // Use the browser editing pipeline first; ProseMirror/Lexical usually notices this
-    // more reliably than simply assigning textContent.
+   // Use the browser editing pipeline first; ProseMirror/Lexical usually notices this
+   // more reliably than simply assigning textContent.
     try {
       const sel = window.getSelection();
       const range = document.createRange();
@@ -276,7 +276,7 @@
       }
     } catch {}
 
-    // Fallback if execCommand is unavailable.
+   // Fallback if execCommand is unavailable.
     try {
       el.textContent = text;
       el.dispatchEvent(new InputEvent('input', {
@@ -333,8 +333,8 @@
     if (!el) return;
     const text = editorText(el);
     const existing = read(draftKey(), null);
-    // During a reload ChatGPT may create an empty editor before our restore runs.
-    // Never let that transient empty state erase a previously saved non-empty draft.
+   // During a reload ChatGPT may create an empty editor before our restore runs.
+   // Never let that transient empty state erase a previously saved non-empty draft.
     if (!text && existing?.text && !editorTouchedThisSession) return;
     write(draftKey(), {
       text,
@@ -365,7 +365,7 @@
 
     const now = Date.now();
 
-    // A single Enter may trigger keydown + click + submit. De-duplicate them.
+   // A single Enter may trigger keydown + click + submit. De-duplicate them.
     if (text === lastCapturedText && now - lastCapturedAt < 1500) return;
     lastCapturedText = text;
     lastCapturedAt = now;
@@ -399,7 +399,7 @@
     upsertHistory(item);
     historyPage = 0;
 
-    // Once submitted, it is no longer an "unsent draft"; keep it safely in history.
+   // Once submitted, it is no longer an "unsent draft"; keep it safely in history.
     remove(draftKey());
 
     currentPending = item;
@@ -525,8 +525,8 @@
     const idleMs = Date.now() - lastProgressAt;
     const ageMs = Date.now() - currentPending.sentAt;
 
-    // Before any assistant text appears, a long silent interval is suspicious.
-    // During generation, only warn if the UI still looks like generation is active.
+   // Before any assistant text appears, a long silent interval is suspicious.
+   // During generation, only warn if the UI still looks like generation is active.
     const suspicious =
       (!responseStarted && ageMs >= CFG.stallWarnMs) ||
       (responseStarted && isGenerating() && idleMs >= CFG.stallWarnMs);
@@ -752,7 +752,7 @@
       ? Math.max(150, panelHeight - listHeight)
       : 190;
 
-    // Reserve room for pagination because it appears only when multiple pages exist.
+   // Reserve room for pagination because it appears only when multiple pages exist.
     return Math.max(
       CFG.minPageContentHeight,
       viewportTarget - nonListHeight - 44
@@ -790,7 +790,7 @@
     for (let i = 0; i < heights.length; i++) {
       const h = heights[i];
 
-      // Always allow at least one full Prompt per page, even if it alone is tall.
+     // Always allow at least one full Prompt per page, even if it alone is tall.
       if (i > start && used + h > budget) {
         pages.push({ start, end: i });
         start = i;
@@ -865,7 +865,7 @@
     if (!(e.target === el || el.contains?.(e.target))) return;
     if (e.isComposing) return;
 
-    // ChatGPT normally uses Enter to submit and Shift+Enter for newline.
+   // ChatGPT normally uses Enter to submit and Shift+Enter for newline.
     if (e.key === 'Enter' && !e.shiftKey) {
       captureSubmittedPrompt('keydown');
     }
