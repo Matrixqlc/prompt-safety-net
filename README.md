@@ -21,6 +21,7 @@
 - 在发送、点击发送按钮或表单提交时备份 Prompt，并保存最近 30 条历史记录。
 - 历史 Prompt 会自动去重：同样的 Prompt 再次使用时不会新增重复记录，而是更新最近使用时间并累计“已使用 N 次”。
 - 历史记录支持恢复、复制、单条删除和收藏；收藏项会优先显示，并在再次使用同一 Prompt 时保留收藏状态。
+- 顶部“导出”按钮可将当前全部 Prompt 历史导出为 JSON，保留正文、收藏状态、使用次数、首次/最近使用时间、状态和来源会话信息，便于备份和后续迁移。
 - 普通历史最多保留最近 200 条去重后的 Prompt；收藏项不参与这个上限，不会因为历史滚动而被自动淘汰。
 - 历史分页不再固定条数：脚本会按当前窗口高度和每条 Prompt 的实际渲染高度动态分页，短 Prompt 一页多放、长 Prompt 一页少放。
 - Prompt 正文完整显示，不再为了凑固定条数而截断；即使单条 Prompt 很长，也会优先保证这一条完整可见。
@@ -37,3 +38,12 @@
 ## 文档
 
 使用说明、设计记录和变更日志维护在独立文档仓库：[prompt-safety-net-docs](https://github.com/Matrixqlc/prompt-safety-net-docs)。
+
+
+## 导出格式
+
+导出文件名形如：
+
+`prompt-safety-net-2026-09-21-003015.json`
+
+JSON 顶层包含 `format`、`schemaVersion`、`exportedAt`、`promptCount` 和 `prompts`。当前 `schemaVersion` 为 1，后续如增加导入功能，将以此结构作为兼容基础。
