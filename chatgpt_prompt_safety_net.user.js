@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Prompt Safety Net for ChatGPT
 // @namespace    https://chatgpt.com/
-// @version      0.5.1
+// @version      0.5.2
 // @description  Auto-save ChatGPT prompts, archive submitted prompts, restore after refresh, and warn about offline/stalled responses.
 // @author       ChatGPT
 // @homepageURL  https://github.com/Matrixqlc/prompt-safety-net
@@ -548,7 +548,7 @@
       #cgpt-psn-button { border: 1px solid rgba(0,0,0,.16); background: rgba(255,255,255,.96); color: #111; border-radius: 999px; padding: 8px 12px; box-shadow: 0 6px 24px rgba(0,0,0,.14); cursor: pointer; }
       #cgpt-psn-button[data-tone="warn"] { border-color: #b7791f; }
       #cgpt-psn-button[data-tone="bad"] { border-color: #c53030; }
-      #cgpt-psn-panel { width: min(430px, calc(100vw - 36px)); max-height: 62vh; overflow: auto; margin-bottom: 8px; border: 1px solid rgba(0,0,0,.14); background: rgba(255,255,255,.985); border-radius: 14px; box-shadow: 0 12px 38px rgba(0,0,0,.20); padding: 12px; display:none; }
+      #cgpt-psn-panel { width: min(430px, calc(100vw - 36px)); height:auto; overflow:visible; margin-bottom: 8px; border: 1px solid rgba(0,0,0,.14); background: rgba(255,255,255,.985); border-radius: 14px; box-shadow: 0 12px 38px rgba(0,0,0,.20); padding: 12px; display:none; }
       #cgpt-psn-panel.open { display:block; }
       .cgpt-psn-title { font-weight: 700; margin-bottom: 5px; }
       .cgpt-psn-status { padding: 7px 8px; border-radius: 9px; background: rgba(0,0,0,.05); margin-bottom: 9px; word-break: break-word; }
@@ -559,7 +559,9 @@
       .cgpt-psn-item { border-top:1px solid rgba(0,0,0,.09); padding:9px 0; }
       .cgpt-psn-item[data-favorite="true"] .cgpt-psn-meta { opacity:.9; font-weight:600; }
       .cgpt-psn-meta { opacity:.58; font-size:10.5px; margin-bottom:5px; }
-      .cgpt-psn-preview { white-space:pre-wrap; max-height:5.2em; overflow:hidden; word-break:break-word; margin-bottom:8px; font-size:14px; line-height:1.55; font-weight:450; }
+      .cgpt-psn-preview { display:flex; align-items:flex-start; gap:7px; white-space:pre-wrap; max-height:5.2em; overflow:hidden; word-break:break-word; margin-bottom:8px; font-size:14px; line-height:1.55; font-weight:450; }
+      .cgpt-psn-seq { flex:0 0 auto; min-width:1.7em; text-align:right; font-size:11px; line-height:1.95; opacity:.48; font-variant-numeric:tabular-nums; }
+      .cgpt-psn-prompt-text { min-width:0; flex:1 1 auto; }
       .cgpt-psn-item-actions { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:6px; }
       .cgpt-psn-pagination { position:sticky; bottom:-12px; display:flex; align-items:center; justify-content:space-between; gap:8px; padding:8px 0 2px; margin-top:4px; border-top:1px solid rgba(0,0,0,.09); background:rgba(255,255,255,.985); }
       .cgpt-psn-page-info { flex:1; text-align:center; font-size:11px; opacity:.7; white-space:nowrap; }
@@ -576,7 +578,7 @@
       @media (max-width: 640px) {
         #cgpt-psn-root { left:8px; right:8px; bottom:76px; }
         #cgpt-psn-button { float:right; }
-        #cgpt-psn-panel { width:100%; max-height:74vh; box-sizing:border-box; padding:10px; }
+        #cgpt-psn-panel { width:100%; height:auto; max-height:none; overflow:visible; box-sizing:border-box; padding:10px; }
         .cgpt-psn-actions button { flex:1 1 calc(50% - 3px); padding:6px 5px; }
         .cgpt-psn-preview { max-height:4.65em; font-size:13.5px; line-height:1.55; }
         .cgpt-psn-item-actions { gap:4px; }
@@ -742,10 +744,13 @@
     const start = historyPage * CFG.pageSize;
     const pageItems = hist.slice(start, start + CFG.pageSize);
 
-    uiList.innerHTML = pageItems.map(item => `
+    uiList.innerHTML = pageItems.map((item, index) => `
       <div class="cgpt-psn-item" data-favorite="${item.favorite ? 'true' : 'false'}">
         <div class="cgpt-psn-meta">${item.favorite ? '★ 已收藏 · ' : ''}${escapeHtml(fmtTime(item.sentAt))} · 已使用 ${escapeHtml(Number(item.useCount) || 1)} 次 · ${escapeHtml(item.status || 'saved')}</div>
-        <div class="cgpt-psn-preview">${escapeHtml(item.text || '')}</div>
+        <div class="cgpt-psn-preview">
+          <span class="cgpt-psn-seq">${start + index + 1}.</span>
+          <span class="cgpt-psn-prompt-text">${escapeHtml(item.text || '')}</span>
+        </div>
         <div class="cgpt-psn-item-actions">
           <button data-act="restore-history" data-id="${escapeHtml(item.id)}">恢复</button>
           <button data-act="copy-history" data-id="${escapeHtml(item.id)}">复制</button>
