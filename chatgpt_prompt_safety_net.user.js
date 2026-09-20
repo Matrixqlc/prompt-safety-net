@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Prompt Safety Net for ChatGPT
 // @namespace    https://chatgpt.com/
-// @version      0.5.2
+// @version      0.6.0
 // @description  Auto-save ChatGPT prompts, archive submitted prompts, restore after refresh, and warn about offline/stalled responses.
 // @author       ChatGPT
 // @homepageURL  https://github.com/Matrixqlc/prompt-safety-net
@@ -28,7 +28,8 @@
     autoRestoreMaxAgeMs: 24 * 60 * 60 * 1000,
     pendingResumeMaxAgeMs: 2 * 60 * 60 * 1000,
     regularHistoryLimit: 200,   // favorites are kept outside this cap
-    pageSize: 8,
+    panelViewportRatio: 0.88,    // approximate maximum panel height before making another page
+    minPageContentHeight: 220,
     pollMs: 2000,
   };
 
@@ -559,11 +560,11 @@
       .cgpt-psn-item { border-top:1px solid rgba(0,0,0,.09); padding:9px 0; }
       .cgpt-psn-item[data-favorite="true"] .cgpt-psn-meta { opacity:.9; font-weight:600; }
       .cgpt-psn-meta { opacity:.58; font-size:10.5px; margin-bottom:5px; }
-      .cgpt-psn-preview { display:flex; align-items:flex-start; gap:7px; white-space:pre-wrap; max-height:5.2em; overflow:hidden; word-break:break-word; margin-bottom:8px; font-size:14px; line-height:1.55; font-weight:450; }
+      .cgpt-psn-preview { display:flex; align-items:flex-start; gap:7px; white-space:pre-wrap; max-height:none; overflow:visible; word-break:break-word; margin-bottom:8px; font-size:14px; line-height:1.55; font-weight:450; }
       .cgpt-psn-seq { flex:0 0 auto; min-width:1.7em; text-align:right; font-size:11px; line-height:1.95; opacity:.48; font-variant-numeric:tabular-nums; }
       .cgpt-psn-prompt-text { min-width:0; flex:1 1 auto; }
       .cgpt-psn-item-actions { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:6px; }
-      .cgpt-psn-pagination { position:sticky; bottom:-12px; display:flex; align-items:center; justify-content:space-between; gap:8px; padding:8px 0 2px; margin-top:4px; border-top:1px solid rgba(0,0,0,.09); background:rgba(255,255,255,.985); }
+      .cgpt-psn-pagination { display:flex; align-items:center; justify-content:space-between; gap:8px; padding:8px 0 2px; margin-top:4px; border-top:1px solid rgba(0,0,0,.09); background:rgba(255,255,255,.985); }
       .cgpt-psn-page-info { flex:1; text-align:center; font-size:11px; opacity:.7; white-space:nowrap; }
       .cgpt-psn-foot { opacity:.55; font-size:11px; margin-top:8px; }
       #cgpt-psn-toast { position:fixed; left:50%; bottom:26px; transform:translateX(-50%); z-index:2147483647; background:rgba(0,0,0,.82); color:#fff; border-radius:9px; padding:8px 12px; font:13px system-ui; pointer-events:none; opacity:0; transition:opacity .18s; }
@@ -580,10 +581,9 @@
         #cgpt-psn-button { float:right; }
         #cgpt-psn-panel { width:100%; height:auto; max-height:none; overflow:visible; box-sizing:border-box; padding:10px; }
         .cgpt-psn-actions button { flex:1 1 calc(50% - 3px); padding:6px 5px; }
-        .cgpt-psn-preview { max-height:4.65em; font-size:13.5px; line-height:1.55; }
+        .cgpt-psn-preview { max-height:none; overflow:visible; font-size:13.5px; line-height:1.55; }
         .cgpt-psn-item-actions { gap:4px; }
         .cgpt-psn-item-actions button { min-width:0; padding:4px 2px; font-size:10.5px; }
-        .cgpt-psn-pagination { bottom:-10px; }
       }
     `;
     document.head?.appendChild(st);
@@ -726,6 +726,83 @@
       .replaceAll('"', '&quot;');
   }
 
+  function historyItemHtml(item, absoluteIndex) {
+    return `
+      <div class="cgpt-psn-item" data-favorite="${item.favorite ? 'true' : 'false'}">
+        <div class="cgpt-psn-meta">${item.favorite ? '★ 已收藏 · ' : ''}${escapeHtml(fmtTime(item.sentAt))} · 已使用 ${escapeHtml(Number(item.useCount) || 1)} 次 · ${escapeHtml(item.status || 'saved')}</div>
+        <div class="cgpt-psn-preview">
+          <span class="cgpt-psn-seq">${absoluteIndex + 1}.</span>
+          <span class="cgpt-psn-prompt-text">${escapeHtml(item.text || '')}</span>
+        </div>
+        <div class="cgpt-psn-item-actions">
+          <button data-act="restore-history" data-id="${escapeHtml(item.id)}">恢复</button>
+          <button data-act="copy-history" data-id="${escapeHtml(item.id)}">复制</button>
+          <button data-act="delete-history" data-id="${escapeHtml(item.id)}">删除</button>
+          <button data-act="toggle-favorite" data-id="${escapeHtml(item.id)}">${item.favorite ? '取消收藏' : '收藏'}</button>
+        </div>
+      </div>
+    `;
+  }
+
+  function adaptivePageContentBudget() {
+    const viewportTarget = Math.floor(window.innerHeight * CFG.panelViewportRatio);
+    const panelHeight = uiPanel?.getBoundingClientRect().height || 0;
+    const listHeight = uiList?.getBoundingClientRect().height || 0;
+    const nonListHeight = panelHeight > 0
+      ? Math.max(150, panelHeight - listHeight)
+      : 190;
+
+    // Reserve room for pagination because it appears only when multiple pages exist.
+    return Math.max(
+      CFG.minPageContentHeight,
+      viewportTarget - nonListHeight - 44
+    );
+  }
+
+  function buildAdaptivePages(hist) {
+    if (!hist.length) return [];
+
+    const width = Math.max(
+      260,
+      Math.floor(uiList?.getBoundingClientRect().width || uiPanel?.getBoundingClientRect().width || 406)
+    );
+    const measure = document.createElement('div');
+    measure.style.cssText = `
+      position:fixed;
+      left:-10000px;
+      top:0;
+      width:${width}px;
+      visibility:hidden;
+      pointer-events:none;
+      z-index:-1;
+    `;
+    measure.innerHTML = hist.map((item, index) => historyItemHtml(item, index)).join('');
+    document.body.appendChild(measure);
+
+    const heights = [...measure.children].map(el => Math.ceil(el.getBoundingClientRect().height));
+    measure.remove();
+
+    const budget = adaptivePageContentBudget();
+    const pages = [];
+    let start = 0;
+    let used = 0;
+
+    for (let i = 0; i < heights.length; i++) {
+      const h = heights[i];
+
+      // Always allow at least one full Prompt per page, even if it alone is tall.
+      if (i > start && used + h > budget) {
+        pages.push({ start, end: i });
+        start = i;
+        used = 0;
+      }
+      used += h;
+    }
+
+    pages.push({ start, end: hist.length });
+    return pages;
+  }
+
   function updatePanel() {
     ensureUI();
     if (!uiList || !uiPager) return;
@@ -739,31 +816,20 @@
       return;
     }
 
-    const totalPages = Math.max(1, Math.ceil(hist.length / CFG.pageSize));
+    const pages = buildAdaptivePages(hist);
+    const totalPages = Math.max(1, pages.length);
     historyPage = Math.min(Math.max(0, historyPage), totalPages - 1);
-    const start = historyPage * CFG.pageSize;
-    const pageItems = hist.slice(start, start + CFG.pageSize);
+    const page = pages[historyPage] || { start: 0, end: hist.length };
+    const pageItems = hist.slice(page.start, page.end);
 
-    uiList.innerHTML = pageItems.map((item, index) => `
-      <div class="cgpt-psn-item" data-favorite="${item.favorite ? 'true' : 'false'}">
-        <div class="cgpt-psn-meta">${item.favorite ? '★ 已收藏 · ' : ''}${escapeHtml(fmtTime(item.sentAt))} · 已使用 ${escapeHtml(Number(item.useCount) || 1)} 次 · ${escapeHtml(item.status || 'saved')}</div>
-        <div class="cgpt-psn-preview">
-          <span class="cgpt-psn-seq">${start + index + 1}.</span>
-          <span class="cgpt-psn-prompt-text">${escapeHtml(item.text || '')}</span>
-        </div>
-        <div class="cgpt-psn-item-actions">
-          <button data-act="restore-history" data-id="${escapeHtml(item.id)}">恢复</button>
-          <button data-act="copy-history" data-id="${escapeHtml(item.id)}">复制</button>
-          <button data-act="delete-history" data-id="${escapeHtml(item.id)}">删除</button>
-          <button data-act="toggle-favorite" data-id="${escapeHtml(item.id)}">${item.favorite ? '取消收藏' : '收藏'}</button>
-        </div>
-      </div>
-    `).join('');
+    uiList.innerHTML = pageItems
+      .map((item, index) => historyItemHtml(item, page.start + index))
+      .join('');
 
     uiPager.hidden = totalPages <= 1;
     uiPager.innerHTML = totalPages <= 1 ? '' : `
       <button data-act="page-prev" ${historyPage === 0 ? 'disabled' : ''}>‹ 上一页</button>
-      <span class="cgpt-psn-page-info">${historyPage + 1} / ${totalPages} · ${hist.length} 条</span>
+      <span class="cgpt-psn-page-info">${historyPage + 1} / ${totalPages} · ${page.start + 1}-${page.end} / ${hist.length} 条</span>
       <button data-act="page-next" ${historyPage >= totalPages - 1 ? 'disabled' : ''}>下一页 ›</button>
     `;
   }
@@ -838,6 +904,15 @@
     setInterval(saveDraftNow, CFG.autosaveHeartbeatMs);
     setInterval(monitorConnectionAndProgress, CFG.pollMs);
     window.addEventListener('beforeunload', saveDraftNow);
+
+    let resizeTimer = null;
+    window.addEventListener('resize', () => {
+      clearTimeout(resizeTimer);
+      resizeTimer = setTimeout(() => {
+        historyPage = 0;
+        updatePanel();
+      }, 160);
+    });
 
     if (!navigator.onLine) setStatus('浏览器已离线；Prompt 备份仍在', 'bad');
     else setStatus('正在保护输入内容', 'ok');
