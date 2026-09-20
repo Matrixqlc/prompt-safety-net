@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Prompt Safety Net for ChatGPT
 // @namespace    https://chatgpt.com/
-// @version      0.5.0
+// @version      0.5.1
 // @description  Auto-save ChatGPT prompts, archive submitted prompts, restore after refresh, and warn about offline/stalled responses.
 // @author       ChatGPT
 // @homepageURL  https://github.com/Matrixqlc/prompt-safety-net
@@ -553,12 +553,13 @@
       .cgpt-psn-title { font-weight: 700; margin-bottom: 5px; }
       .cgpt-psn-status { padding: 7px 8px; border-radius: 9px; background: rgba(0,0,0,.05); margin-bottom: 9px; word-break: break-word; }
       .cgpt-psn-actions { display:flex; flex-wrap:wrap; gap:6px; margin-bottom:10px; }
-      .cgpt-psn-actions button, .cgpt-psn-item button, .cgpt-psn-pagination button { border:1px solid rgba(0,0,0,.15); background:#fff; border-radius:8px; padding:6px 8px; cursor:pointer; }
+      .cgpt-psn-actions button, .cgpt-psn-pagination button { border:1px solid rgba(0,0,0,.15); background:#fff; border-radius:8px; padding:6px 8px; cursor:pointer; }
+      .cgpt-psn-item button { border:1px solid rgba(0,0,0,.15); background:#fff; border-radius:7px; padding:4px 6px; font-size:11px; line-height:1.2; cursor:pointer; }
       .cgpt-psn-pagination button:disabled { opacity:.38; cursor:default; }
       .cgpt-psn-item { border-top:1px solid rgba(0,0,0,.09); padding:9px 0; }
       .cgpt-psn-item[data-favorite="true"] .cgpt-psn-meta { opacity:.9; font-weight:600; }
-      .cgpt-psn-meta { opacity:.62; font-size:11px; margin-bottom:4px; }
-      .cgpt-psn-preview { white-space:pre-wrap; max-height:4.4em; overflow:hidden; word-break:break-word; margin-bottom:6px; }
+      .cgpt-psn-meta { opacity:.58; font-size:10.5px; margin-bottom:5px; }
+      .cgpt-psn-preview { white-space:pre-wrap; max-height:5.2em; overflow:hidden; word-break:break-word; margin-bottom:8px; font-size:14px; line-height:1.55; font-weight:450; }
       .cgpt-psn-item-actions { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:6px; }
       .cgpt-psn-pagination { position:sticky; bottom:-12px; display:flex; align-items:center; justify-content:space-between; gap:8px; padding:8px 0 2px; margin-top:4px; border-top:1px solid rgba(0,0,0,.09); background:rgba(255,255,255,.985); }
       .cgpt-psn-page-info { flex:1; text-align:center; font-size:11px; opacity:.7; white-space:nowrap; }
@@ -577,9 +578,9 @@
         #cgpt-psn-button { float:right; }
         #cgpt-psn-panel { width:100%; max-height:74vh; box-sizing:border-box; padding:10px; }
         .cgpt-psn-actions button { flex:1 1 calc(50% - 3px); padding:6px 5px; }
-        .cgpt-psn-preview { max-height:3em; }
+        .cgpt-psn-preview { max-height:4.65em; font-size:13.5px; line-height:1.55; }
         .cgpt-psn-item-actions { gap:4px; }
-        .cgpt-psn-item-actions button { min-width:0; padding:6px 3px; font-size:12px; }
+        .cgpt-psn-item-actions button { min-width:0; padding:4px 2px; font-size:10.5px; }
         .cgpt-psn-pagination { bottom:-10px; }
       }
     `;
