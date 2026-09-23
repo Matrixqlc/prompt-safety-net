@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Prompt Safety Net for ChatGPT
 // @namespace    https://chatgpt.com/
-// @version      0.6.3
+// @version      0.6.4
 // @description  Auto-save ChatGPT prompts, archive submitted prompts, restore after refresh, and warn about offline/stalled responses.
 // @author       ChatGPT
 // @homepageURL  https://github.com/Matrixqlc/prompt-safety-net
@@ -52,22 +52,328 @@
   let editorTouchedThisSession = false;
   let historyPage = 0;
 
+  // ---------- Bounded, content-free diagnostics ----------
+  // One shared storage key, not one key/file per conversation or tab.
+  const VERSION = '0.6.4';
+  const DIAG = Object.freeze({
+    key: 'cgpt_psn_diagnostics_v1',
+    maxEntries: 500,
+    maxBytes: 256 * 1024, // compact UTF-8 JSON, including the envelope
+    maxAgeMs: 7 * 24 * 60 * 60 * 1000,
+    flushMs: 2000,
+    maxPerMinute: 120,
+  });
+  const diagStartedAt = Date.now();
+  const diagSession = Math.random().toString(36).slice(2, 12);
+  const diagEncoder = new TextEncoder();
+  const diagEvents = new Set([
+    'startup', 'ready', 'editor-state', 'route-change', 'draft-saved',
+    'send-event', 'send-skipped', 'capture-result', 'response-seen',
+    'storage-error', 'storage-recovered', 'diagnostics-error',
+    'handler-error', 'network-state', 'pagehide', 'export',
+  ]);
+  // Closed field/value allowlists: no prompt text, hashes, URLs, DOM markup,
+  // account IDs, exception messages/stacks, cookies or authorization headers.
+  const diagEnums = {
+    via: ['keydown', 'click', 'submit'],
+    result: ['empty', 'duplicate', 'saved', 'partial', 'failed', 'read-failed',
+      'missing-editor', 'composing', 'unmatched-button', 'outside-editor'],
+    operation: ['read', 'write', 'delete', 'list'],
+    area: ['history', 'last-sent', 'draft', 'settings', 'other', 'input',
+      'keydown', 'click', 'submit', 'startup', 'route', 'progress', 'restore',
+      'panel', 'pagehide', 'timer'],
+    route: ['home', 'conversation', 'other'],
+    error: ['Error', 'TypeError', 'ReferenceError', 'RangeError', 'SyntaxError',
+      'SecurityError', 'QuotaExceededError', 'InvalidStateError', 'NotAllowedError',
+      'AbortError', 'NetworkError', 'ReadbackMismatch', 'InvalidData', 'OtherError'],
+  };
+  const diagNumbers = new Set(['chars', 'selector', 'elapsedMs']);
+  const diagBooleans = new Set(['online', 'editorFound', 'trusted', 'historySaved',
+    'lastSaved', 'composing', 'shift', 'ctrl', 'meta', 'alt', 'disabled']);
+  let diagPending = [], diagTimer = null, diagSequence = 0;
+  let diagPersistence = 'unknown', diagPersistenceError = '';
+  let diagEditor = -2, diagSuppressed = 0, diagWindowAt = 0, diagWindowCount = 0;
+  let storageFailureSerial = 0;
+  const diagThrottle = new Map(); // bounded independently of the event buffer
+  const storageFaults = new Set(); // fixed area/operation combinations only
+
+  function diagnosticRoute() {
+    if (location.pathname === '/') return 'home';
+    return /(?:^|\/)c\/[^/]+/.test(location.pathname) ? 'conversation' : 'other';
+  }
+
+  function diagnosticError(error) {
+    return diagEnums.error.includes(error?.name) ? error.name : 'OtherError';
+  }
+
+  function diagnosticData(fields = {}) {
+    const safe = {};
+    for (const [key, value] of Object.entries(fields)) {
+      if (diagNumbers.has(key) && Number.isFinite(value)) {
+        safe[key] = Math.max(-2, Math.min(1e9, Math.trunc(value)));
+      } else if (diagBooleans.has(key) && typeof value === 'boolean') {
+        safe[key] = value;
+      } else if (Object.hasOwn(diagEnums, key) && diagEnums[key].includes(value)) {
+        safe[key] = value;
+      }
+    }
+    return safe;
+  }
+
+  function diagnosticBytes(value) {
+    return diagEncoder.encode(JSON.stringify(value)).length;
+  }
+
+  function trimDiagnostics(records, clearedAt = 0) {
+    const now = Date.now(), unique = new Map();
+    // Only the newest bounded input can enter the ring, even after corrupt storage.
+    for (const raw of records.slice(-DIAG.maxEntries * 2)) {
+      if (!raw || !diagEvents.has(raw.event) || !Number.isFinite(raw.at) ||
+          raw.at <= clearedAt || raw.at < now - DIAG.maxAgeMs || raw.at > now + 60_000 ||
+          typeof raw.session !== 'string' || !/^[a-z0-9]{1,12}$/.test(raw.session) ||
+          !Number.isSafeInteger(raw.seq) || raw.seq < 1) continue;
+      const item = { at: raw.at, session: raw.session, seq: raw.seq,
+        event: raw.event, data: diagnosticData(raw.data) };
+      unique.set(`${item.session}:${item.seq}`, item);
+    }
+    const items = [...unique.values()].sort((a, b) => a.at - b.at || a.seq - b.seq)
+      .slice(-DIAG.maxEntries);
+    const sizes = items.map(item => diagnosticBytes(item) + 1);
+    let bytes = sizes.reduce((sum, size) => sum + size, 2), start = 0;
+    // Reserve space for metadata, then enforce the exact envelope limit below.
+    while (start < items.length && bytes > DIAG.maxBytes - 4096) bytes -= sizes[start++];
+    return items.slice(start);
+  }
+
+  function diagnosticEvent(event, fields = {}, cooldownMs = 0) {
+    if (!diagEvents.has(event)) return false;
+    const now = Date.now(), data = diagnosticData(fields);
+    const key = `${event}:${data.area || ''}:${data.operation || ''}:${data.result || ''}`;
+    if (now - diagWindowAt >= 60_000 || now < diagWindowAt) {
+      diagWindowAt = now;
+      diagWindowCount = 0;
+    }
+    if ((cooldownMs && diagThrottle.has(key) && now - diagThrottle.get(key) < cooldownMs) ||
+        diagWindowCount >= DIAG.maxPerMinute) {
+      diagSuppressed = Math.min(1e9, diagSuppressed + 1);
+      return false;
+    }
+    if (cooldownMs) {
+      diagThrottle.delete(key);
+      diagThrottle.set(key, now);
+      if (diagThrottle.size > 64) diagThrottle.delete(diagThrottle.keys().next().value);
+    }
+    diagWindowCount++;
+    diagPending.push({ at: now, session: diagSession, seq: ++diagSequence, event, data });
+    diagPending = trimDiagnostics(diagPending);
+    if (!diagTimer) diagTimer = setTimeout(flushDiagnostics, DIAG.flushMs);
+    return true;
+  }
+
+  function renderDiagnosticHealth() {
+    const el = document.getElementById('cgpt-psn-health');
+    if (!el) return;
+    const editor = diagEditor >= 0 ? '输入框已识别' : '输入框尚未识别';
+    const storage = storageFaults.size ? 'Prompt 存储有异常' : '未发现 Prompt 存储异常';
+    const logs = diagPersistence === 'error' ? '日志仅暂存内存，请及时导出' :
+      diagPersistence === 'ok' ? '日志已写入本地' : '日志等待写入';
+    const text = `v${VERSION} · ${editor} · ${storage} · ${logs}`;
+    if (el.textContent !== text) el.textContent = text;
+  }
+
+  function diagnosticEditor(selector) {
+    if (diagEditor === selector) return;
+    diagEditor = selector;
+    diagnosticEvent('editor-state', { selector, editorFound: selector >= 0 });
+    renderDiagnosticHealth();
+  }
+
+  function diagnosticStorageFailure(operation, error) {
+    diagPersistence = 'error';
+    diagPersistenceError = diagnosticError(error);
+    // Never use the instrumented storage wrappers here: no recursive logging.
+    if (diagnosticEvent('diagnostics-error', { operation, error: diagPersistenceError }, 30_000)) {
+      console.warn('[Prompt Safety Net] Diagnostic storage failed:', operation, diagPersistenceError);
+    }
+    renderDiagnosticHealth();
+  }
+
+  function readDiagnosticStore() {
+    const raw = GM_getValue(DIAG.key, '');
+    if (!raw) return { events: [], clearedAt: 0, raw: '' };
+    if (typeof raw !== 'string' || diagEncoder.encode(raw).length > DIAG.maxBytes) {
+      diagnosticEvent('diagnostics-error', { operation: 'read', error: 'InvalidData' }, 30_000);
+      return { events: [], clearedAt: 0, raw: '' };
+    }
+    try {
+      const value = JSON.parse(raw);
+      if (!value || !Array.isArray(value.events)) throw new Error();
+      return { events: trimDiagnostics(value.events), raw,
+        clearedAt: Number.isFinite(value.clearedAt) ? Math.max(0, Math.min(Date.now(), value.clearedAt)) : 0 };
+    } catch {
+      diagnosticEvent('diagnostics-error', { operation: 'read', error: 'InvalidData' }, 30_000);
+      return { events: [], clearedAt: 0, raw: '' };
+    }
+  }
+
+  function diagnosticEnvelope(events, clearedAt = 0, exported = false) {
+    const payload = {
+      format: 'prompt-safety-net-diagnostics', schemaVersion: 1, scriptVersion: VERSION,
+      limits: { maxEntries: DIAG.maxEntries, maxBytes: DIAG.maxBytes, maxAgeDays: 7 },
+      clearedAt,
+      runtime: { session: diagSession, startedAt: diagStartedAt,
+        editorSelector: diagEditor, online: navigator.onLine, route: diagnosticRoute(),
+        promptStorageFaults: storageFaults.size, logPersistence: diagPersistence,
+        logPersistenceError: diagPersistenceError, suppressedThisPage: diagSuppressed },
+      events: trimDiagnostics(events, clearedAt),
+    };
+    if (exported) payload.exportedAt = new Date().toISOString();
+    while (payload.events.length && diagnosticBytes(payload) > DIAG.maxBytes) payload.events.shift();
+    return payload;
+  }
+
+  function flushDiagnostics() {
+    clearTimeout(diagTimer);
+    diagTimer = null;
+    let operation = 'read';
+    try {
+      const disk = readDiagnosticStore();
+      const payload = diagnosticEnvelope([...disk.events, ...diagPending], disk.clearedAt);
+      // The read-back only verifies the storage API, not a physical disk fsync.
+      payload.runtime.logPersistence = 'ok';
+      payload.runtime.logPersistenceError = '';
+      const encoded = JSON.stringify(payload);
+      if (encoded !== disk.raw) {
+        operation = 'write';
+        GM_setValue(DIAG.key, encoded);
+        if (GM_getValue(DIAG.key) !== encoded) throw { name: 'ReadbackMismatch' };
+      }
+      diagPending = [];
+      diagPersistence = 'ok';
+      diagPersistenceError = '';
+      renderDiagnosticHealth();
+      return true;
+    } catch (error) {
+      diagnosticStorageFailure(operation, error);
+      return false; // Keep the bounded memory ring available for export.
+    }
+  }
+
+  function exportDiagnostics() {
+    diagnosticEvent('export');
+    flushDiagnostics();
+    let disk = { events: [], clearedAt: 0 };
+    try { disk = readDiagnosticStore(); }
+    catch (error) { diagnosticStorageFailure('read', error); }
+    const payload = diagnosticEnvelope([...disk.events, ...diagPending], disk.clearedAt, true);
+    const blob = new Blob([JSON.stringify(payload)], { type: 'application/json;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `prompt-safety-net-diagnostics-${new Date().toISOString().replace(/[:.]/g, '-')}.json`;
+    a.style.display = 'none';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    toast(`已导出 ${payload.events.length} 条诊断日志（不含 Prompt 正文）`);
+  }
+
+  function clearDiagnostics() {
+    // An empty envelope carries a cutoff so other tabs cannot re-add old buffers.
+    const payload = diagnosticEnvelope([], Date.now());
+    const encoded = JSON.stringify(payload);
+    try {
+      GM_setValue(DIAG.key, encoded);
+      if (GM_getValue(DIAG.key) !== encoded) throw { name: 'ReadbackMismatch' };
+      clearTimeout(diagTimer);
+      diagTimer = null;
+      diagPending = [];
+      diagThrottle.clear();
+      diagSuppressed = 0;
+      diagWindowCount = 0;
+      diagPersistence = 'ok';
+      diagPersistenceError = '';
+      renderDiagnosticHealth();
+      toast('诊断日志已清空；Prompt 历史和收藏未改动');
+    } catch (error) {
+      diagnosticStorageFailure('delete', error);
+      toast('诊断日志清空失败，请先导出');
+    }
+  }
+
+  function storageArea(key) {
+    if (key === K.HISTORY) return 'history';
+    if (key === K.LAST_SENT) return 'last-sent';
+    if (key.startsWith(K.DRAFT_PREFIX)) return 'draft';
+    return 'settings';
+  }
+
+  function noteStorage(operation, key, error = null) {
+    const area = storageArea(key), fault = `${area}:${operation}`;
+    if (error) {
+      storageFailureSerial++;
+      storageFaults.add(fault);
+      diagnosticEvent('storage-error', { area, operation, error: diagnosticError(error) }, 30_000);
+    } else if (storageFaults.delete(fault)) {
+      diagnosticEvent('storage-recovered', { area, operation });
+    }
+    renderDiagnosticHealth();
+  }
+
+  function diagnosticGuard(area, fn) {
+    return function (...args) {
+      const failed = error => {
+        if (diagnosticEvent('handler-error', { area, error: diagnosticError(error) }, 30_000)) {
+          console.warn('[Prompt Safety Net] Handler failed:', area, diagnosticError(error));
+        }
+        if (document.getElementById('cgpt-psn-status')) {
+          setStatus('安全网运行异常，请导出诊断日志', 'bad');
+        }
+      };
+      try {
+        const result = fn.apply(this, args);
+        if (result && typeof result.catch === 'function') return result.catch(failed);
+        return result;
+      } catch (error) { failed(error); }
+    };
+  }
+
   // ---------- Storage ----------
   const read = (key, fallback = null) => {
     try {
       const v = GM_getValue(key);
+      noteStorage('read', key);
       return v === undefined ? fallback : v;
-    } catch {
+    } catch (error) {
+      noteStorage('read', key, error);
       return fallback;
     }
   };
 
-  const write = (key, value) => {
-    try { GM_setValue(key, value); } catch {}
+  const write = (key, value, verify = false) => {
+    try {
+      GM_setValue(key, value);
+      if (verify && JSON.stringify(GM_getValue(key)) !== JSON.stringify(value)) {
+        throw { name: 'ReadbackMismatch' };
+      }
+      noteStorage('write', key);
+      return true;
+    } catch (error) {
+      noteStorage('write', key, error);
+      return false;
+    }
   };
 
   const remove = (key) => {
-    try { GM_deleteValue(key); } catch {}
+    try {
+      GM_deleteValue(key);
+      noteStorage('delete', key);
+      return true;
+    } catch (error) {
+      noteStorage('delete', key, error);
+      return false;
+    }
   };
 
   function routeKey() {
@@ -156,16 +462,18 @@
     return pruned;
   }
 
-  function setHistory(h) {
-    write(K.HISTORY, pruneHistory(h));
+  function setHistory(h, verify = false) {
+    return write(K.HISTORY, pruneHistory(h), verify);
   }
 
-  function upsertHistory(item) {
+  function upsertHistory(item, verify = false) {
+    const failureBeforeRead = storageFailureSerial;
     const h = getHistory();
+    if (storageFailureSerial !== failureBeforeRead) return false;
     const i = h.findIndex(x => x.id === item.id);
     if (i >= 0) h[i] = { ...h[i], ...item };
     else h.unshift(item);
-    setHistory(h);
+    return setHistory(h, verify);
   }
 
   function findHistoryByText(text) {
@@ -268,10 +576,14 @@
       'textarea[placeholder*="Message"]',
       'textarea[placeholder*="消息"]',
     ];
-    for (const sel of selectors) {
-      const el = document.querySelector(sel);
-      if (el && isVisible(el)) return el;
+    for (let index = 0; index < selectors.length; index++) {
+      const el = document.querySelector(selectors[index]);
+      if (el && isVisible(el)) {
+        diagnosticEditor(index);
+        return el;
+      }
     }
+    diagnosticEditor(-1);
     return null;
   }
 
@@ -382,18 +694,21 @@
     // During a reload ChatGPT may create an empty editor before our restore runs.
     // Never let that transient empty state erase a previously saved non-empty draft.
     if (!text && existing?.text && !editorTouchedThisSession) return;
-    write(draftKey(), {
+    const saved = write(draftKey(), {
       text,
       savedAt: Date.now(),
       url: location.href,
       routeKey: routeKey(),
     });
+    if (saved && text !== (existing?.text || '')) {
+      diagnosticEvent('draft-saved', { chars: text.length }, 30_000);
+    }
     updatePanel();
   }
 
   function scheduleDraftSave() {
     clearTimeout(saveTimer);
-    saveTimer = setTimeout(saveDraftNow, CFG.draftDebounceMs);
+    saveTimer = setTimeout(diagnosticGuard('draft', saveDraftNow), CFG.draftDebounceMs);
   }
 
   function makeId(text, ts) {
@@ -406,17 +721,29 @@
   }
 
   function captureSubmittedPrompt(reason) {
-    const text = editorText().trimEnd();
-    if (!text.trim()) return;
+    const el = getEditor();
+    const text = editorText(el).trimEnd();
+    diagnosticEvent('send-event', { via: reason, editorFound: !!el, chars: text.length });
+    if (!text.trim()) {
+      diagnosticEvent('capture-result', { via: reason, result: el ? 'empty' : 'missing-editor', chars: text.length });
+      return;
+    }
 
     const now = Date.now();
 
     // A single Enter may trigger keydown + click + submit. De-duplicate them.
-    if (text === lastCapturedText && now - lastCapturedAt < 1500) return;
-    lastCapturedText = text;
-    lastCapturedAt = now;
+    if (text === lastCapturedText && now - lastCapturedAt < 1500) {
+      diagnosticEvent('capture-result', { via: reason, result: 'duplicate', chars: text.length });
+      return;
+    }
 
+    const failureBeforeRead = storageFailureSerial;
     const existing = findHistoryByText(text);
+    if (storageFailureSerial !== failureBeforeRead) {
+      diagnosticEvent('capture-result', { via: reason, result: 'read-failed', chars: text.length });
+      setStatus('历史读取失败，未覆盖原记录；请导出诊断日志', 'bad');
+      return;
+    }
     const item = existing ? {
       ...existing,
       text,
@@ -441,20 +768,30 @@
       favorite: false,
     };
 
-    write(K.LAST_SENT, item);
-    upsertHistory(item);
+    const lastSaved = write(K.LAST_SENT, item, true);
+    const historySaved = upsertHistory(item, true);
+    diagnosticEvent('capture-result', { via: reason, chars: text.length, lastSaved, historySaved,
+      result: lastSaved && historySaved ? 'saved' : lastSaved || historySaved ? 'partial' : 'failed' });
+    if (!lastSaved && !historySaved) {
+      setStatus('Prompt 备份失败，草稿未主动删除；请导出诊断日志', 'bad');
+      toast('备份失败，请导出诊断日志');
+      return;
+    }
+    lastCapturedText = text;
+    lastCapturedAt = now;
     historyPage = 0;
 
-    // Once submitted, it is no longer an "unsent draft"; keep it safely in history.
-    remove(draftKey());
+    // Only discard the draft after both destinations pass API read-back.
+    if (lastSaved && historySaved) remove(draftKey());
 
     currentPending = item;
     responseStarted = false;
     lastProgressFingerprint = progressFingerprint();
     lastProgressAt = now;
 
-    setStatus('已备份刚发送的 Prompt', 'ok');
-    toast('已备份本次 Prompt');
+    setStatus(lastSaved && historySaved ? '已备份刚发送的 Prompt' : '备份不完整，请导出诊断日志',
+      lastSaved && historySaved ? 'ok' : 'bad');
+    toast(lastSaved && historySaved ? '已备份本次 Prompt' : '备份不完整，请导出诊断日志');
     updatePanel();
   }
 
@@ -467,6 +804,7 @@
     };
     write(K.LAST_SENT, currentPending);
     upsertHistory(currentPending);
+    diagnosticEvent('response-seen');
     updatePanel();
   }
 
@@ -645,17 +983,20 @@
     uiRoot.innerHTML = `
       <div id="cgpt-psn-panel">
         <div class="cgpt-psn-title">Prompt 安全网</div>
-        <div class="cgpt-psn-status" id="cgpt-psn-status">正在保护输入内容</div>
+        <div class="cgpt-psn-status" id="cgpt-psn-status">脚本已启动，等待发送</div>
+        <div class="cgpt-psn-meta" id="cgpt-psn-health"></div>
         <div class="cgpt-psn-actions">
           <button data-act="restore-draft">恢复未发送草稿</button>
           <button data-act="restore-last">恢复上次发送</button>
           <button data-act="copy-last">复制上次发送</button>
-          <button data-act="export">导出</button>
+          <button data-act="export">导出 Prompt</button>
+          <button data-act="export-diagnostics">导出诊断日志</button>
           <button data-act="clear">清空记录</button>
+          <button data-act="clear-diagnostics">清空诊断日志</button>
         </div>
         <div id="cgpt-psn-list"></div>
         <div id="cgpt-psn-pagination" class="cgpt-psn-pagination" hidden></div>
-        <div class="cgpt-psn-foot">仅保存文字 Prompt；附件/图片不会被备份。普通历史最多保留 200 条，收藏不参与自动淘汰。数据保存在 Tampermonkey 本地脚本存储中。</div>
+        <div class="cgpt-psn-foot">仅保存文字 Prompt；附件/图片不会被备份。普通历史最多保留 200 条，收藏不参与自动淘汰。数据保存在 Tampermonkey 本地脚本存储中。诊断日志不含正文，最多 500 条 / 256 KiB / 7 天，先到先淘汰。</div>
       </div>
       <button id="cgpt-psn-button" title="Prompt 安全网">Prompt 安全网</button>
     `;
@@ -672,7 +1013,7 @@
       updatePanel();
     });
 
-    uiPanel.addEventListener('click', async (e) => {
+    uiPanel.addEventListener('click', diagnosticGuard('panel', async (e) => {
       const b = e.target.closest('button');
       if (!b) return;
 
@@ -681,6 +1022,10 @@
       if (act === 'restore-last') restoreLastSent();
       if (act === 'copy-last') await copyLastSent();
       if (act === 'export') exportHistory();
+      if (act === 'export-diagnostics') exportDiagnostics();
+      if (act === 'clear-diagnostics' && window.confirm('仅清空诊断日志？Prompt 历史和收藏不会删除。')) {
+        clearDiagnostics();
+      }
 
       if (act === 'clear') {
         try {
@@ -740,8 +1085,9 @@
         historyPage += 1;
         updatePanel();
       }
-    });
+    }));
 
+    renderDiagnosticHealth();
     updatePanel();
   }
 
@@ -752,8 +1098,8 @@
     if (uiButton) {
       uiButton.dataset.tone = tone;
       uiButton.textContent =
-        tone === 'bad' ? 'Prompt 安全网 · 离线' :
-        tone === 'warn' ? 'Prompt 安全网 · 疑似卡住' :
+        tone === 'bad' ? 'Prompt 安全网 · 异常' :
+        tone === 'warn' ? 'Prompt 安全网 · 提醒' :
         'Prompt 安全网';
     }
   }
@@ -908,20 +1254,33 @@
   }
 
   function onDocumentKeydown(e) {
+    // No per-keystroke logging. Observe only Enter without Shift in an editor.
+    if (e.key !== 'Enter' || e.shiftKey) return;
     const el = getEditor();
-    if (!el) return;
-    if (!(e.target === el || el.contains?.(e.target))) return;
-    if (e.isComposing) return;
-
-    // ChatGPT normally uses Enter to submit and Shift+Enter for newline.
-    if (e.key === 'Enter' && !e.shiftKey) {
-      captureSubmittedPrompt('keydown');
+    if (!el) {
+      if (e.target?.closest?.('textarea, [contenteditable="true"]')) {
+        diagnosticEvent('send-skipped', { via: 'keydown', result: 'missing-editor' }, 1000);
+      }
+      return;
     }
+    if (!(e.target === el || el.contains?.(e.target))) return;
+    if (e.isComposing) {
+      diagnosticEvent('send-skipped', { via: 'keydown', result: 'composing' }, 1000);
+      return;
+    }
+    captureSubmittedPrompt('keydown');
   }
 
   function onDocumentClick(e) {
     if (sendButtonFromTarget(e.target)) {
       captureSubmittedPrompt('click');
+    } else {
+      const button = e.target?.closest?.('button');
+      if (!button || button.closest('#cgpt-psn-root')) return;
+      const el = getEditor();
+      if (el && button.closest('form')?.contains(el)) {
+        diagnosticEvent('send-skipped', { via: 'click', result: 'unmatched-button', disabled: !!button.disabled }, 1000);
+      }
     }
   }
 
@@ -929,6 +1288,8 @@
     const el = getEditor();
     if (el && e.target?.contains?.(el)) {
       captureSubmittedPrompt('submit');
+    } else if (!el) {
+      diagnosticEvent('send-skipped', { via: 'submit', result: 'missing-editor' }, 1000);
     }
   }
 
@@ -936,7 +1297,8 @@
     const rk = routeKey();
     if (rk === currentRouteKey) return;
     currentRouteKey = rk;
-    setTimeout(maybeAutoRestore, 300);
+    diagnosticEvent('route-change', { route: diagnosticRoute() });
+    setTimeout(diagnosticGuard('restore', maybeAutoRestore), 300);
   }
 
   function initAfterDom() {
@@ -945,13 +1307,21 @@
     resumeRecentPending();
     maybeAutoRestore();
 
-    window.addEventListener('online', () => setStatus('网络已恢复', 'ok'));
-    window.addEventListener('offline', () => setStatus('浏览器已离线；Prompt 备份仍在', 'bad'));
+    window.addEventListener('online', () => {
+      diagnosticEvent('network-state', { online: true });
+      setStatus('网络已恢复', 'ok');
+    });
+    window.addEventListener('offline', () => {
+      diagnosticEvent('network-state', { online: false });
+      setStatus('浏览器已离线；本地备份状态见诊断信息', 'bad');
+    });
 
-    setInterval(routeWatcher, 700);
-    setInterval(saveDraftNow, CFG.autosaveHeartbeatMs);
-    setInterval(monitorConnectionAndProgress, CFG.pollMs);
-    window.addEventListener('beforeunload', saveDraftNow);
+    setInterval(diagnosticGuard('route', routeWatcher), 700);
+    setInterval(diagnosticGuard('draft', saveDraftNow), CFG.autosaveHeartbeatMs);
+    setInterval(diagnosticGuard('progress', monitorConnectionAndProgress), CFG.pollMs);
+    window.addEventListener('beforeunload', diagnosticGuard('draft', saveDraftNow));
+    // Idle expiry cleanup; unchanged logs are not rewritten every minute.
+    setInterval(flushDiagnostics, 60_000);
 
     let resizeTimer = null;
     window.addEventListener('resize', () => {
@@ -963,17 +1333,28 @@
     });
 
     if (!navigator.onLine) setStatus('浏览器已离线；Prompt 备份仍在', 'bad');
-    else setStatus('正在保护输入内容', 'ok');
+    else setStatus('脚本已启动，等待发送；运行状态见下方', 'ok');
+    getEditor();
+    diagnosticEvent('ready', { online: navigator.onLine });
+    flushDiagnostics();
   }
 
-  document.addEventListener('input', onDocumentInput, true);
-  document.addEventListener('keydown', onDocumentKeydown, true);
-  document.addEventListener('click', onDocumentClick, true);
-  document.addEventListener('submit', onDocumentSubmit, true);
+  diagnosticEvent('startup', { online: navigator.onLine, route: diagnosticRoute() });
+  window.addEventListener('pagehide', () => {
+    diagnosticEvent('pagehide');
+    flushDiagnostics();
+  });
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden') flushDiagnostics();
+  });
+  document.addEventListener('input', diagnosticGuard('input', onDocumentInput), true);
+  document.addEventListener('keydown', diagnosticGuard('keydown', onDocumentKeydown), true);
+  document.addEventListener('click', diagnosticGuard('click', onDocumentClick), true);
+  document.addEventListener('submit', diagnosticGuard('submit', onDocumentSubmit), true);
 
   if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', initAfterDom, { once: true });
+    document.addEventListener('DOMContentLoaded', diagnosticGuard('startup', initAfterDom), { once: true });
   } else {
-    initAfterDom();
+    diagnosticGuard('startup', initAfterDom)();
   }
 })();
