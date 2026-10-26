@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Prompt Safety Net for ChatGPT
 // @namespace    https://chatgpt.com/
-// @version      0.6.4
+// @version      0.6.5
 // @description  Auto-save ChatGPT prompts, archive submitted prompts, restore after refresh, and warn about offline/stalled responses.
 // @author       ChatGPT
 // @homepageURL  https://github.com/Matrixqlc/prompt-safety-net
@@ -49,12 +49,15 @@
   let lastProgressFingerprint = '';
   let lastProgressAt = 0;
   let responseStarted = false;
+  let sawGenerating = false;
+  let monitorPaused = false;
+  let lastMonitorState = 'idle';
   let editorTouchedThisSession = false;
   let historyPage = 0;
 
   // ---------- Bounded, content-free diagnostics ----------
   // One shared storage key, not one key/file per conversation or tab.
-  const VERSION = '0.6.4';
+  const VERSION = '0.6.5';
   const DIAG = Object.freeze({
     key: 'cgpt_psn_diagnostics_v1',
     maxEntries: 500,
@@ -70,14 +73,16 @@
     'startup', 'ready', 'editor-state', 'route-change', 'draft-saved',
     'send-event', 'send-skipped', 'capture-result', 'response-seen',
     'storage-error', 'storage-recovered', 'diagnostics-error',
-    'handler-error', 'network-state', 'pagehide', 'export',
+    'handler-error', 'network-state', 'pagehide', 'export', 'monitor-state',
   ]);
   // Closed field/value allowlists: no prompt text, hashes, URLs, DOM markup,
   // account IDs, exception messages/stacks, cookies or authorization headers.
   const diagEnums = {
     via: ['keydown', 'click', 'submit'],
     result: ['empty', 'duplicate', 'saved', 'partial', 'failed', 'read-failed',
-      'missing-editor', 'composing', 'unmatched-button', 'outside-editor'],
+      'missing-editor', 'composing', 'unmatched-button', 'outside-editor',
+      'idle', 'waiting', 'resumed', 'responding', 'stalled', 'unobservable',
+      'stopped', 'finished', 'route-changed', 'offline'],
     operation: ['read', 'write', 'delete', 'list'],
     area: ['history', 'last-sent', 'draft', 'settings', 'other', 'input',
       'keydown', 'click', 'submit', 'startup', 'route', 'progress', 'restore',
@@ -173,7 +178,7 @@
   function renderDiagnosticHealth() {
     const el = document.getElementById('cgpt-psn-health');
     if (!el) return;
-    const editor = diagEditor >= 0 ? '输入框已识别' : '输入框尚未识别';
+    const editor = diagEditor >= 0 ? '输入框已识别' : '输入框未识别（当前输入无法自动备份）';
     const storage = storageFaults.size ? 'Prompt 存储有异常' : '未发现 Prompt 存储异常';
     const logs = diagPersistence === 'error' ? '日志仅暂存内存，请及时导出' :
       diagPersistence === 'ok' ? '日志已写入本地' : '日志等待写入';
@@ -224,7 +229,8 @@
       runtime: { session: diagSession, startedAt: diagStartedAt,
         editorSelector: diagEditor, online: navigator.onLine, route: diagnosticRoute(),
         promptStorageFaults: storageFaults.size, logPersistence: diagPersistence,
-        logPersistenceError: diagPersistenceError, suppressedThisPage: diagSuppressed },
+        logPersistenceError: diagPersistenceError, suppressedThisPage: diagSuppressed,
+        monitorState: lastMonitorState },
       events: trimDiagnostics(events, clearedAt),
     };
     if (exported) payload.exportedAt = new Date().toISOString();
@@ -376,10 +382,25 @@
     }
   };
 
-  function routeKey() {
-    const m = location.pathname.match(/^\/c\/([^/?#]+)/);
+  function routeKey(pathname = location.pathname) {
+    // Keep the v3 draft keys unchanged, including project conversation paths.
+    const m = pathname.match(/^\/c\/([^/?#]+)/);
     if (m) return `c:${m[1]}`;
-    return `path:${location.pathname || '/'}`;
+    return `path:${pathname || '/'}`;
+  }
+
+  function pendingRouteKey(item) {
+    if (item?.routeKey?.startsWith('c:')) return item.routeKey;
+    // Normalize older project-chat records that stored the whole /g/.../c/... path.
+    let pathname = '';
+    if (item?.routeKey?.startsWith('path:')) pathname = item.routeKey.slice(5);
+    else {
+      try { pathname = item?.url ? new URL(item.url).pathname : ''; }
+      catch { return ''; }
+    }
+    if (!pathname) return '';
+    const m = pathname.match(/(?:^|\/)c\/([^/?#]+)/);
+    return m ? `c:${m[1]}` : routeKey(pathname);
   }
 
   const draftKey = (rk = routeKey()) => K.DRAFT_PREFIX + rk;
@@ -500,7 +521,9 @@
       currentPending.id === id ||
       normalizePromptText(currentPending.text) === normalizePromptText(item.text)
     )) {
-      currentPending = null;
+      resetMonitoring();
+      noteMonitorState('stopped');
+      setStatus('已删除这条记录，本次提醒已停止', 'ok');
     }
 
     updatePanel();
@@ -575,12 +598,19 @@
       'textarea[data-testid="prompt-textarea"]',
       'textarea[placeholder*="Message"]',
       'textarea[placeholder*="消息"]',
+      'textarea#prompt-textarea',
+      '#prompt-textarea [contenteditable="true"]',
+      '[data-testid="prompt-textarea"] [contenteditable="true"]',
+      '#prompt-textarea[contenteditable="plaintext-only"]',
+      '[data-testid="prompt-textarea"][contenteditable="plaintext-only"]',
     ];
     for (let index = 0; index < selectors.length; index++) {
-      const el = document.querySelector(selectors[index]);
-      if (el && isVisible(el)) {
-        diagnosticEditor(index);
-        return el;
+      for (const el of document.querySelectorAll(selectors[index])) {
+        if (isVisible(el) && !el.disabled && !el.readOnly &&
+            el.getAttribute?.('contenteditable') !== 'false') {
+          diagnosticEditor(index);
+          return el;
+        }
       }
     }
     diagnosticEditor(-1);
@@ -589,6 +619,9 @@
 
   function isVisible(el) {
     if (!el) return false;
+    if (el.hidden || el.closest?.('[hidden], [aria-hidden="true"], #cgpt-psn-root')) return false;
+    const style = window.getComputedStyle?.(el);
+    if (style?.display === 'none' || style?.visibility === 'hidden' || style?.visibility === 'collapse') return false;
     const r = el.getBoundingClientRect();
     return r.width > 0 && r.height > 0;
   }
@@ -660,10 +693,7 @@
       'button[aria-label="停止生成"]',
       'button[aria-label="停止"]',
     ];
-    return selectors.some(sel => {
-      const el = document.querySelector(sel);
-      return el && isVisible(el);
-    });
+    return selectors.some(sel => [...document.querySelectorAll(sel)].some(isVisible));
   }
 
   function assistantNodes() {
@@ -672,14 +702,21 @@
       '[data-turn="assistant"]',
     ];
     for (const sel of selectors) {
-      const nodes = [...document.querySelectorAll(sel)];
+      const nodes = [...document.querySelectorAll(sel)].filter(isVisible);
       if (nodes.length) return nodes;
     }
     return [];
   }
 
-  function progressFingerprint() {
-    const nodes = assistantNodes();
+  function userNodes() {
+    for (const sel of ['[data-message-author-role="user"]', '[data-turn="user"]']) {
+      const nodes = [...document.querySelectorAll(sel)].filter(isVisible);
+      if (nodes.length) return nodes;
+    }
+    return [];
+  }
+
+  function progressFingerprint(nodes = assistantNodes()) {
     const last = nodes.at(-1);
     const text = last ? (last.innerText || last.textContent || '') : '';
     return `${nodes.length}:${text.length}:${text.slice(-80)}`;
@@ -690,10 +727,13 @@
     const el = getEditor();
     if (!el) return;
     const text = editorText(el);
+    const failuresBeforeRead = storageFailureSerial;
     const existing = read(draftKey(), null);
+    if (storageFailureSerial !== failuresBeforeRead) return;
     // During a reload ChatGPT may create an empty editor before our restore runs.
     // Never let that transient empty state erase a previously saved non-empty draft.
     if (!text && existing?.text && !editorTouchedThisSession) return;
+    if (text === (existing?.text || '')) return;
     const saved = write(draftKey(), {
       text,
       savedAt: Date.now(),
@@ -703,7 +743,8 @@
     if (saved && text !== (existing?.text || '')) {
       diagnosticEvent('draft-saved', { chars: text.length }, 30_000);
     }
-    updatePanel();
+    // Draft text is not displayed in the history list. Do not rebuild and measure
+    // every saved prompt on each keystroke/heartbeat, especially while collapsed.
   }
 
   function scheduleDraftSave() {
@@ -785,9 +826,13 @@
     if (lastSaved && historySaved) remove(draftKey());
 
     currentPending = item;
+    currentRouteKey = routeKey();
     responseStarted = false;
+    sawGenerating = false;
+    monitorPaused = false;
     lastProgressFingerprint = progressFingerprint();
     lastProgressAt = now;
+    noteMonitorState('waiting');
 
     setStatus(lastSaved && historySaved ? '已备份刚发送的 Prompt' : '备份不完整，请导出诊断日志',
       lastSaved && historySaved ? 'ok' : 'bad');
@@ -795,15 +840,32 @@
     updatePanel();
   }
 
+  function patchMonitoredSubmission(fields) {
+    if (!currentPending) return;
+    const sameSubmission = item => item?.id === currentPending.id &&
+      item?.sentAt === currentPending.sentAt;
+    const beforeLast = storageFailureSerial;
+    const last = read(K.LAST_SENT, null);
+    if (storageFailureSerial === beforeLast && sameSubmission(last)) {
+      write(K.LAST_SENT, { ...last, ...fields });
+    }
+    const beforeHistory = storageFailureSerial;
+    const history = getHistory();
+    if (storageFailureSerial === beforeHistory) {
+      const index = history.findIndex(sameSubmission);
+      if (index >= 0) {
+        history[index] = { ...history[index], ...fields };
+        setHistory(history);
+      }
+    }
+    // A later submission in another tab may reuse the same history ID. Its
+    // timestamp, use count, favorite state and last-sent backup belong to it.
+    currentPending = { ...currentPending, ...fields };
+  }
+
   function markPendingResponseSeen() {
     if (!currentPending || currentPending.status !== 'pending') return;
-    currentPending = {
-      ...currentPending,
-      status: 'response-seen',
-      responseSeenAt: Date.now(),
-    };
-    write(K.LAST_SENT, currentPending);
-    upsertHistory(currentPending);
+    patchMonitoredSubmission({ status: 'response-seen', responseSeenAt: Date.now() });
     diagnosticEvent('response-seen');
     updatePanel();
   }
@@ -847,11 +909,13 @@
   }
 
   function maybeAutoRestore() {
+    const restoreRoute = routeKey();
     const d = read(draftKey(), null);
     if (!d?.text) return;
     if (Date.now() - d.savedAt > CFG.autoRestoreMaxAgeMs) return;
 
     const tryRestore = () => {
+      if (routeKey() !== restoreRoute) return true; // Stop an old page's retry.
       const el = getEditor();
       if (!el) return false;
       if (editorText(el).trim()) return true; // Don't overwrite ChatGPT/user content.
@@ -872,52 +936,128 @@
   }
 
   // ---------- Connectivity / stall detection ----------
-  function resumeRecentPending() {
-    const last = read(K.LAST_SENT, null);
-    if (!last || last.status !== 'pending') return;
-    if (Date.now() - last.sentAt > CFG.pendingResumeMaxAgeMs) return;
+  function noteMonitorState(state) {
+    if (lastMonitorState === state) return;
+    lastMonitorState = state;
+    diagnosticEvent('monitor-state', { area: 'progress', result: state });
+  }
 
-    currentPending = last;
-    lastProgressFingerprint = progressFingerprint();
-    lastProgressAt = last.sentAt;
+  function resetMonitoring() {
+    currentPending = null;
     responseStarted = false;
+    sawGenerating = false;
+    monitorPaused = false;
+    lastProgressFingerprint = '';
+    lastProgressAt = 0;
+  }
+
+  function stopCurrentMonitoring() {
+    patchMonitoredSubmission({ status: 'monitoring-stopped' });
+    resetMonitoring();
+    noteMonitorState('stopped');
+    setStatus('已停止本次提醒；Prompt 备份仍保留', 'ok');
+    updatePanel();
+  }
+
+  function resumeRecentPending() {
+    resetMonitoring();
+    const last = read(K.LAST_SENT, null);
+    if (!last || !['pending', 'response-seen'].includes(last.status)) return false;
+    const age = Date.now() - last.sentAt;
+    if (!Number.isFinite(age) || age < 0 || age > CFG.pendingResumeMaxAgeMs) return false;
+    const rk = pendingRouteKey({ routeKey: routeKey() });
+    // LAST_SENT is shared by tabs. A generic landing page is not a conversation
+    // identity, and an old pending backup is not evidence of a live request.
+    if (!rk.startsWith('c:') || pendingRouteKey(last) !== rk) return false;
+    if (!getEditor() || !isGenerating()) {
+      noteMonitorState('unobservable');
+      setStatus('上次 Prompt 备份仍在；刷新后的回复状态尚未确认', 'ok');
+      return false;
+    }
+    currentPending = { ...last, routeKey: rk };
+    lastProgressFingerprint = progressFingerprint();
+    lastProgressAt = Date.now(); // Never count time when this page was not observed.
+    responseStarted = last.status === 'response-seen';
+    sawGenerating = true;
+    noteMonitorState('resumed');
+    setStatus('已接续当前会话监控；计时从本次观察开始', 'ok');
+    return true;
   }
 
   function monitorConnectionAndProgress() {
+    // The progress poll can run before the route poll. Share the same handoff
+    // check so a verified home -> conversation transition is not discarded.
+    if (routeKey() !== currentRouteKey) routeWatcher();
     if (!navigator.onLine) {
+      monitorPaused = true;
+      noteMonitorState('offline');
       setStatus('浏览器已离线；Prompt 备份仍在', 'bad');
       return;
     }
 
-    if (!currentPending || currentPending.status !== 'pending') {
+    if (!currentPending) {
       if (lastUiStatus.startsWith('浏览器已离线')) {
         setStatus('网络已恢复', 'ok');
       }
       return;
     }
 
-    const fp = progressFingerprint();
-    if (fp !== lastProgressFingerprint) {
+    if (pendingRouteKey(currentPending) !== pendingRouteKey({ routeKey: routeKey() })) {
+      resetMonitoring();
+      noteMonitorState('route-changed');
+      setStatus('已切换页面；原 Prompt 备份仍保留', 'ok');
+      return;
+    }
+    if (document.visibilityState === 'hidden') {
+      monitorPaused = true;
+      return;
+    }
+
+    const el = getEditor();
+    const generating = isGenerating();
+    const nodes = assistantNodes();
+    const observable = el && (generating || nodes.length || userNodes().length);
+    if (!observable) {
+      monitorPaused = true;
+      noteMonitorState('unobservable');
+      setStatus('页面输入框或回复状态尚未识别，暂不判断是否卡住；备份仍保留', 'ok');
+      return;
+    }
+    if (monitorPaused) {
+      lastProgressAt = Date.now();
+      monitorPaused = false;
+      noteMonitorState(responseStarted ? 'responding' : 'waiting');
+      setStatus('已恢复观察当前页面，重新计算等待时间；备份仍保留', 'ok');
+    }
+    if (generating) sawGenerating = true;
+
+    const fp = progressFingerprint(nodes);
+    if (nodes.length && fp !== lastProgressFingerprint) {
       lastProgressFingerprint = fp;
       lastProgressAt = Date.now();
       responseStarted = true;
       markPendingResponseSeen();
+      noteMonitorState('responding');
       setStatus('已看到助手响应；Prompt 备份已保留', 'ok');
+    }
+
+    if (!generating && (responseStarted || sawGenerating)) {
+      const seen = responseStarted;
+      resetMonitoring();
+      noteMonitorState('finished');
+      setStatus(seen ? '已看到助手响应；当前未检测到继续生成，备份仍保留' :
+        '当前未检测到继续生成；回复结果尚未确认，备份仍保留', 'ok');
       return;
     }
 
     const idleMs = Date.now() - lastProgressAt;
-    const ageMs = Date.now() - currentPending.sentAt;
-
-    // Before any assistant text appears, a long silent interval is suspicious.
-    // During generation, only warn if the UI still looks like generation is active.
-    const suspicious =
-      (!responseStarted && ageMs >= CFG.stallWarnMs) ||
-      (responseStarted && isGenerating() && idleMs >= CFG.stallWarnMs);
-
-    if (suspicious) {
-      const sec = Math.floor(Math.max(ageMs, idleMs) / 1000);
-      setStatus(`疑似卡住：约 ${sec}s 没有可见响应进展`, 'warn');
+    if (idleMs >= CFG.stallWarnMs) {
+      const sec = Math.floor(idleMs / 1000);
+      noteMonitorState('stalled');
+      setStatus(`当前页面约 ${sec}s 未见回复进展，可能仍在处理；可停止本次提醒`, 'warn');
+    } else if (!responseStarted) {
+      noteMonitorState('waiting');
+      setStatus('Prompt 已备份，正在等待当前页面的回复进展', 'ok');
     }
   }
 
@@ -989,6 +1129,7 @@
           <button data-act="restore-draft">恢复未发送草稿</button>
           <button data-act="restore-last">恢复上次发送</button>
           <button data-act="copy-last">复制上次发送</button>
+          <button data-act="stop-monitoring">停止本次提醒</button>
           <button data-act="export">导出 Prompt</button>
           <button data-act="export-diagnostics">导出诊断日志</button>
           <button data-act="clear">清空记录</button>
@@ -1021,6 +1162,7 @@
       if (act === 'restore-draft') restoreUnsentDraft();
       if (act === 'restore-last') restoreLastSent();
       if (act === 'copy-last') await copyLastSent();
+      if (act === 'stop-monitoring') stopCurrentMonitoring();
       if (act === 'export') exportHistory();
       if (act === 'export-diagnostics') exportDiagnostics();
       if (act === 'clear-diagnostics' && window.confirm('仅清空诊断日志？Prompt 历史和收藏不会删除。')) {
@@ -1037,7 +1179,8 @@
         }
         remove(K.HISTORY);
         remove(K.LAST_SENT);
-        currentPending = null;
+        resetMonitoring();
+        noteMonitorState('idle');
         historyPage = 0;
         setStatus('本地 Prompt 记录已清空', 'ok');
         updatePanel();
@@ -1121,9 +1264,14 @@
   }
 
   function historyItemHtml(item, absoluteIndex) {
+    const status = {
+      pending: '已备份 · 未确认回复',
+      'response-seen': '已观察到回复',
+      'monitoring-stopped': '已备份 · 已停止提醒',
+    }[item.status] || item.status || '已备份';
     return `
       <div class="cgpt-psn-item" data-favorite="${item.favorite ? 'true' : 'false'}">
-        <div class="cgpt-psn-meta">${item.favorite ? '★ 已收藏 · ' : ''}${escapeHtml(fmtTime(item.sentAt))} · 已使用 ${escapeHtml(Number(item.useCount) || 1)} 次 · ${escapeHtml(item.status || 'saved')}</div>
+        <div class="cgpt-psn-meta">${item.favorite ? '★ 已收藏 · ' : ''}${escapeHtml(fmtTime(item.sentAt))} · 已使用 ${escapeHtml(Number(item.useCount) || 1)} 次 · ${escapeHtml(status)}</div>
         <div class="cgpt-psn-preview">
           <span class="cgpt-psn-seq">${absoluteIndex + 1}.</span>
           <span class="cgpt-psn-prompt-text">${escapeHtml(item.text || '')}</span>
@@ -1199,7 +1347,7 @@
 
   function updatePanel() {
     ensureUI();
-    if (!uiList || !uiPager) return;
+    if (!uiList || !uiPager || !uiPanel.classList.contains('open')) return;
 
     const hist = getHistory();
     if (!hist.length) {
@@ -1296,14 +1444,32 @@
   function routeWatcher() {
     const rk = routeKey();
     if (rk === currentRouteKey) return;
+    const monitorRoute = pendingRouteKey({ routeKey: rk });
+    const lastUser = userNodes().at(-1);
+    const ownNewConversation = currentPending && pendingRouteKey(currentPending) === 'path:/' &&
+      monitorRoute.startsWith('c:') && lastUser &&
+      normalizePromptText(lastUser.innerText || lastUser.textContent || '') ===
+        normalizePromptText(currentPending.text);
+    if (ownNewConversation) {
+      patchMonitoredSubmission({ routeKey: monitorRoute, url: location.href });
+    } else {
+      resetMonitoring();
+      noteMonitorState('route-changed');
+      setStatus('已切换页面；原 Prompt 备份仍保留', 'ok');
+    }
     currentRouteKey = rk;
+    editorTouchedThisSession = false;
     diagnosticEvent('route-change', { route: diagnosticRoute() });
-    setTimeout(diagnosticGuard('restore', maybeAutoRestore), 300);
+    setTimeout(diagnosticGuard('restore', () => {
+      if (routeKey() === rk) maybeAutoRestore();
+    }), 300);
   }
 
   function initAfterDom() {
     ensureUI();
     currentRouteKey = routeKey();
+    if (!navigator.onLine) setStatus('浏览器已离线；Prompt 备份仍在', 'bad');
+    else setStatus('脚本已启动，等待发送；运行状态见下方', 'ok');
     resumeRecentPending();
     maybeAutoRestore();
 
@@ -1332,8 +1498,6 @@
       }, 160);
     });
 
-    if (!navigator.onLine) setStatus('浏览器已离线；Prompt 备份仍在', 'bad');
-    else setStatus('脚本已启动，等待发送；运行状态见下方', 'ok');
     getEditor();
     diagnosticEvent('ready', { online: navigator.onLine });
     flushDiagnostics();
@@ -1345,7 +1509,10 @@
     flushDiagnostics();
   });
   document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'hidden') flushDiagnostics();
+    if (document.visibilityState === 'hidden') {
+      monitorPaused = true;
+      flushDiagnostics();
+    }
   });
   document.addEventListener('input', diagnosticGuard('input', onDocumentInput), true);
   document.addEventListener('keydown', diagnosticGuard('keydown', onDocumentKeydown), true);
@@ -1358,3 +1525,4 @@
     diagnosticGuard('startup', initAfterDom)();
   }
 })();
+
